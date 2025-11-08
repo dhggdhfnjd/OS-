@@ -142,22 +142,32 @@ void *malloc(size_t size)
         insert_to_free_list(idx, p);  
         initial = 1;
     }
-    if(size == 0)
-    {
-        char buffer[128];
+    if (size == 0) {
+        char buf[64];
         size_t max_size = find_largest_free_size(0);
-        int len = snprintf(buffer, sizeof(buffer), "Max Free Chunk Size = %zu\n", max_size);
-        if(len > 0 && len < sizeof(buffer))
-        {
-            write(1, buffer, len);  // 1 是 stdout 的檔案描述符
+        const char *prefix = "Max Free Chunk Size = ";
+        write(1, prefix, 23);
+    
+        char tmp[32];
+        int t = 0;
+        if (max_size == 0) {
+            tmp[t++] = '0';
+        } else {
+            while (max_size > 0) {
+                tmp[t++] = '0' + (max_size % 10);
+                max_size /= 10;
+            }
         }
+        for (int i = t - 1; i >= 0; --i) buf[t - 1 - i] = tmp[i];
+        write(1, buf, t);
+        write(1, "\n", 1);
+    
         munmap(pool_start, 20000);
         pool_start = NULL;
         initial = 0;
-        for(int i=0;i<11;i++) 
-        free_list[i] = NULL;
+        for (int i = 0; i < 11; i++) free_list[i] = NULL;
         return NULL;
-    }
+    }    
     if(size % 32 == 0)
     {
         space=size;
