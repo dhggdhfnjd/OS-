@@ -1,159 +1,248 @@
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <string.h>
-
-#define POOL_SIZE 20000
-#define HDR_SIZE 32
-#define ALIGN 32
-#define LEVELS 11
-#define NONE 0xFFFFFFFFu
-
-typedef struct {
-  uint32_t total;
-  uint32_t prev;
-  uint32_t next_free;
-  uint32_t prev_free;
-  uint32_t used;
-  uint32_t pad[3];
-} Header;
-
-static void *pool_base = NULL;
-static int initialized = 0;
-static uint32_t free_head[LEVELS];
-static uint32_t free_tail[LEVELS];
-
-static inline uint32_t ptr2off(void *p){ return (uint32_t)((uintptr_t)p - (uintptr_t)pool_base); }
-static inline Header* off2hdr(uint32_t o){ return (Header*)((uintptr_t)pool_base + o); }
-static inline Header* right_of(Header* h){ return (Header*)((char*)h + h->total); }
-static inline Header* left_of(Header* h){ return (h->prev==0)?NULL:(Header*)((char*)h - h->prev); }
-static inline int within(void* p){ return p>=pool_base && (uintptr_t)p < (uintptr_t)pool_base + POOL_SIZE; }
-static inline uint32_t round_up32(uint32_t x){ return (x + (ALIGN-1)) & ~(ALIGN-1); }
-
-static int level_for_payload(uint32_t payload){
-  int l=0; uint32_t v=payload;
-  while(v>64 && l<LEVELS-1){ v>>=1; l++; }
-  return l;
-}
-
-static void add_tail(int lvl, Header* h){
-  h->next_free=NONE;
-  h->prev_free=free_tail[lvl];
-  if(free_tail[lvl]!=NONE) off2hdr(free_tail[lvl])->next_free=ptr2off(h);
-  else free_head[lvl]=ptr2off(h);
-  free_tail[lvl]=ptr2off(h);
-}
-
-static void remove_from_level(int lvl, Header* h){
-  uint32_t off=ptr2off(h);
-  uint32_t prev=h->prev_free,next=h->next_free;
-  if(prev!=NONE) off2hdr(prev)->next_free=next; else free_head[lvl]=next;
-  if(next!=NONE) off2hdr(next)->prev_free=prev; else free_tail[lvl]=prev;
-  h->next_free=h->prev_free=NONE;
-}
-
-static void init_pool(){
-  pool_base=mmap(NULL,POOL_SIZE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-  for(int i=0;i<LEVELS;i++){ free_head[i]=free_tail[i]=NONE; }
-  Header*h=(Header*)pool_base;
-  h->total=POOL_SIZE; h->prev=0; h->next_free=NONE; h->prev_free=NONE; h->used=0;
-  memset(h->pad,0,sizeof(h->pad));
-  add_tail(level_for_payload(POOL_SIZE-HDR_SIZE),h);
-  initialized=1;
-}
-
-static void coalesce_and_add(Header*h){
-  Header*r=right_of(h);
-  if(within(r)&&r->used==0){
-    int lvl=level_for_payload(r->total-HDR_SIZE);
-    remove_from_level(lvl,r);
-    h->total+=r->total;
-    Header*rr=right_of(h);
-    if(within(rr)) rr->prev=h->total;
-  }
-  Header*l=left_of(h);
-  if(l&&l->used==0){
-    int lvl=level_for_payload(l->total-HDR_SIZE);
-    remove_from_level(lvl,l);
-    l->total+=h->total;
-    Header*rr=right_of(l);
-    if(within(rr)) rr->prev=l->total;
-    h=l;
-  }
-  h->used=0;
-  add_tail(level_for_payload(h->total-HDR_SIZE),h);
-}
-
-static Header* best_fit(int lvl,uint32_t need_total){
-  Header*best=NULL; uint32_t best_size=0;
-  for(uint32_t cur=free_head[lvl];cur!=NONE;cur=off2hdr(cur)->next_free){
-    Header*c=off2hdr(cur);
-    if(c->total>=need_total){
-      if(!best||c->total<best_size){best=c;best_size=c->total;}
+#include<stdio.h>
+#include<sys/mman.h>
+#include<unistd.h> 
+void* pool_start;
+//這樣是可以先儲存通諭整標，可以指向任何類型的資料，因為記憶體回傳位置不知道是哪裡來的資料
+int pool_base,initial=0;
+void *malloc(size_t size);
+void free(void *ptr);
+struct header
+{
+    int status;
+    size_t size;
+    struct header *prev;      
+    struct header *next;
+};
+struct header *p,*free_list[11];
+int store_free_list_index(size_t size)
+{
+    int k=0;
+    for(int i = 5 ; i < 16; i++ )
+    {
+        if(i==5)
+        {
+            if(size == 1 << 5)
+            {
+                return 0;
+            }
+        }
+        if( size >= 1 << i && size <= 1 << (i + 1))
+        {
+            return i-5;
+        }
     }
-  }
-  return best;
+    return 0;
 }
 
-static Header* find_block(uint32_t need_total){
-  int lvl=level_for_payload(need_total-HDR_SIZE);
-  for(int L=lvl;L<LEVELS;L++){
-    Header*h=best_fit(L,need_total);
-    if(h) return h;
-  }
-  return NULL;
-}
-
-static void split_and_alloc(Header*h,uint32_t need_total){
-  uint32_t old=h->total;
-  uint32_t rem=(old>need_total)?old-need_total:0;
-  int lvl=level_for_payload(old-HDR_SIZE);
-  remove_from_level(lvl,h);
-  if(rem>=HDR_SIZE+ALIGN){
-    h->total=need_total; h->used=1;
-    Header*remh=(Header*)((char*)h+need_total);
-    remh->total=rem; remh->prev=need_total; remh->used=0;
-    remh->next_free=remh->prev_free=NONE;
-    memset(remh->pad,0,sizeof(remh->pad));
-    Header*right=right_of(remh);
-    if(within(right)) right->prev=rem;
-    add_tail(level_for_payload(rem-HDR_SIZE),remh);
-  }else h->used=1;
-}
-
-void* malloc(size_t size){
-  if(!initialized) init_pool();
-  if(size==0){
-    size_t maxp=0;
-    for(int L=0;L<LEVELS;L++){
-      for(uint32_t cur=free_head[L];cur!=NONE;cur=off2hdr(cur)->next_free){
-        Header*h=off2hdr(cur);
-        size_t p=h->total-HDR_SIZE;
-        if(p>maxp) maxp=p;
-      }
+struct header *find_best_fit(int idx, size_t size)
+{
+    struct header *current = free_list[idx];
+    struct header *best_fit = NULL;
+    size_t min = (size_t)-1; 
+    while (current != NULL)
+    {
+        if (current->size >= size && current->status == 0)
+        {
+            size_t diff = current->size - size;
+            if (diff < min)
+            {
+                min= diff;
+                best_fit = current;
+                if (min== 0) 
+                    break;
+            }
+        }
+        current = current->next;
     }
-    char buf[128];
-    int n=snprintf(buf,sizeof(buf),"Max Free Chunk Size = %zu in bytes\n",maxp);
-    if(n>0) write(1,buf,(size_t)n);
-    munmap(pool_base,POOL_SIZE);
-    pool_base=NULL; initialized=0;
-    for(int i=0;i<LEVELS;i++){free_head[i]=free_tail[i]=NONE;}
+    return best_fit;
+}
+
+void insert_to_free_list(int idx, struct header *node)
+{
+    if(free_list[idx] == NULL)
+    {
+        free_list[idx] = node;
+        node->next = NULL;
+    }
+    else
+    {
+        struct header *current = free_list[idx];
+        free_list[idx]=node;
+        node->next = current;
+    }
+}
+
+void delete_in_free_list(int idx , struct header *node)
+{
+    if(free_list[idx] == NULL)
+    {
+        return;
+    }
+    else
+    {
+        struct header *current = free_list[idx];
+        struct header *prev = NULL,*next = NULL;
+        while (current != NULL && current != node) {
+            prev = current;
+            current = current->next;
+        }
+        if (current == NULL) return;          
+        
+        if (prev == NULL) {
+            free_list[idx] = node->next;
+            node->next = NULL;                
+        } else {
+            prev->next = current->next;
+            node->next = NULL;
+        }
+    }
+}
+
+struct header *find_mr_one(size_t size,int idx)
+{
+    struct header *mr_one;
+    for(int i = idx; i < 11; i++)
+    {
+        mr_one = find_best_fit(i,size);
+        if(!mr_one)
+        continue;
+        else
+        return mr_one;
+    }
     return NULL;
-  }
-  uint32_t need_payload=round_up32((uint32_t)size);
-  uint32_t need_total=HDR_SIZE+need_payload;
-  Header*h=find_block(need_total);
-  if(!h) return NULL;
-  split_and_alloc(h,need_total);
-  return (char*)h+HDR_SIZE;
 }
+// 這個函式找free_list中從idx開始到11的最大size，並回傳該最大size
+size_t find_largest_free_size(int idx)
+{
+    size_t max_size = 0;
+    for(int i = idx; i <= 10; i++)  // free_list陣列大小為11, index 0~10
+    {
+        struct header *current = free_list[i];
+        while(current)
+        {
+            if (current->status == 0 && current->size > max_size)
+                max_size = current->size;
+            current = current->next;
+        }
+    }
+    return max_size;
+}
+void *malloc(size_t size)
+{
+    int idx,space;
+    struct header *love;
+    if(initial == 0)
+    {
+        pool_start = mmap(NULL, 20000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        p = (struct header *) pool_start;
+        p->status = 0;
+        p->size = 20000-32; 
+        p->prev = NULL; 
+        idx = store_free_list_index(p->size);
+        insert_to_free_list(idx, p);  
+        initial = 1;
+    }
+    if(size == 0)
+    {
+        char buffer[128];
+        size_t max_size = find_largest_free_size(0);
+        int len = snprintf(buffer, sizeof(buffer), "Max Free Chunk Size = %zu\n", max_size);
+        if(len > 0 && len < sizeof(buffer))
+        {
+            write(1, buffer, len);  // 1 是 stdout 的檔案描述符
+        }
+        munmap(pool_start, 20000);
+        pool_start = NULL;
+        initial = 0;
+        for(int i=0;i<11;i++) 
+        free_list[i] = NULL;
+        return NULL;
+    }
+    if(size % 32 == 0)
+    {
+        space=size;
+    }
+    else
+    {
+        space = (size/32+1) * 32;
+    }
+    idx = store_free_list_index(space);
+    love = find_mr_one(space, idx);       
+    if (love == NULL) return NULL;
 
-void free(void*ptr){
-  if(!ptr||!pool_base) return;
-  Header*h=(Header*)((char*)ptr-HDR_SIZE);
-  if(h->used==0) return;
-  h->used=0;
-  coalesce_and_add(h);
+    if(love == NULL)
+        return NULL;
+    idx = store_free_list_index(love->size);
+    delete_in_free_list(idx,love);
+    size_t origin_space=love->size;
+    struct header *k = (struct header *)love; 
+    k->size = space;  
+    k->status = 1;
+    k->prev = love->prev;   
+    k->next = NULL;  
+    size_t leftover = origin_space - space;
+    if (leftover >= sizeof(struct header) + 32) 
+    {struct header *remain = (struct header *)((char*)k + sizeof(struct header) + space);
+    remain->status = 0;
+    remain->size = origin_space - space - sizeof(struct header);
+    remain->prev = k;
+    struct header *right = (struct header *)((char*)remain + sizeof(struct header) + remain->size);
+    if((char*)right < (char*)pool_start + 20000)
+    right->prev = remain;
+    idx = store_free_list_index(remain->size);
+    insert_to_free_list(idx,remain);
+    }
+    return (void*)((char*)k + sizeof(struct header));
+}
+struct header *merge_left(struct header *h)
+{
+    if (h->prev && h->prev->status == 0)
+    {
+        int idx;
+        idx = store_free_list_index(h->prev->size);
+        delete_in_free_list(idx,h->prev);
+        h->prev->size += sizeof(struct header) + h->size;
+        h = h->prev;
+        struct header *right = (struct header *)((char*)h + sizeof(struct header) + h->size);
+        if((char*)right < (char*)pool_start + 20000)
+            right->prev = h;
+        return merge_left(h);
+    }
+    else
+    {
+        return h;
+    }
+}
+struct header *merge_right(struct header *h)
+{
+    struct header *next = (struct header *)((char*)h + sizeof(struct header) + h->size);
+    if((char*)next < (char*)pool_start + 20000 && next->status == 0)
+    {
+        int idx;
+        idx = store_free_list_index((next)->size);
+        delete_in_free_list(idx,(next));
+        h->size += sizeof(struct header) + next->size;
+        struct header *right = (struct header *)((char*)h + sizeof(struct header) + h->size);
+        if((char*)right < (char*)pool_start + 20000)
+            right->prev = h;
+        return merge_right(h);
+    }
+    else
+    {
+        return h;
+    }
+}
+void free(void *ptr)
+{
+    int idx;
+    if(ptr == NULL) return;
+    struct header *h = (struct header*)((char*)ptr - sizeof(struct header));
+    if(h->status != 1) return;  
+   
+    h->status = 0;
+    h = merge_left(h);
+    h = merge_right(h);
+    
+    idx = store_free_list_index(h->size);
+    insert_to_free_list(idx,h);
 }
